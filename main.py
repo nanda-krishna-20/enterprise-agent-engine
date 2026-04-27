@@ -1,14 +1,30 @@
 import os
+from ddtrace import patch_all
+from ddtrace.llmobs import LLMObs
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Patch standard libraries (HTTP requests, generic database calls) for automatic tracing and observability in Datadog.
+patch_all() 
+
+# Enable Datadog Observability for LLMs (only if DD_API_KEY is provided)
+dd_api_key = os.environ.get("DD_API_KEY")
+if dd_api_key:
+    LLMObs.enable(
+        ml_app=os.environ.get("DD_LLMOBS_ML_APP", "enterprise-agent-engine"),
+        api_key=dd_api_key,
+        site=os.environ.get("DD_SITE", "datadoghq.com")
+    )
+
 from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from crewai import Agent, Task, Crew, Process, LLM
-from langchain_openai import ChatOpenAI
-from dotenv import load_dotenv
+from src.tools import search_real_estate_db
 
-# Load environment variables from .env file
-load_dotenv()
 
 # API Keys should be loaded from environment variables
 # Set GROQ_API_KEY, OPENAI_API_KEY, HF_TOKEN in .env or system environment
@@ -44,6 +60,7 @@ def researcher_node(state: AgentState):
             'The language should be clear and accessible to non-experts.',
             'The summary should highlight key technical insights and implications.'
         ],
+        tools=[search_real_estate_db],
         allow_delegation=False,
         llm=llm
     )
@@ -131,31 +148,50 @@ app = builder.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "demo-1"}}
 
 def run_workflow():
-    # Start the Engine
     print("\n--- Starting Engine ---")
-    result = app.invoke(
-    {
-        "topic": "AI Agents",
-        "research_notes": "",
-        "is_approved": False,
-        "final_report": ""
-    },
-    config=config
+    
+    # 1. Initial Kickoff (We don't need to save the result variable anymore)
+    app.invoke(
+        {
+            "topic": "What is the current valuation and cap rate for industrial logistics hubs near the DFW airport?",
+            "research_notes": "",
+            "is_approved": False,
+            "final_report": ""
+        }, 
+        config
     )
+    
+    # 2. The Robust Event Loop
+    while True:
+        # Ask LangGraph for the exact status of the engine
+        current_state = app.get_state(config)
+        
+        # If 'next' is empty, there are no more nodes to run. The graph is done!
+        if not current_state.next:
+            break
+            
+        # Check if the graph is specifically paused at an interrupt
+        if current_state.tasks and current_state.tasks[0].interrupts:
+            interrupt_msg = current_state.tasks[0].interrupts[0].value
+            print(f"\nPAUSED: {interrupt_msg}")
+            
+            user_input = input("Your Response: ")
+            
+            print("\n--- Resuming Engine ---")
+            # Resume execution with the user's input
+            app.invoke(Command(resume=user_input), config)
+        else:
+            # Failsafe: if it pauses for an unknown reason, break to avoid infinite loop
+            break
 
-    # Check for interrupts
-    while "__interrupt__" in result:
-        print(f"\nPAUSED: {result['__interrupt__'][0].value}")
-
-        # Capture the human's response
-        user_input = input("Your Response: ")
-
-        # Resume the Engine with the human's input
-        # We don't pass the initial state again, just the interrupt response and a 'Command' to resume
-        print("\n--- Resuming Engine ---")
-        final_result = app.invoke(Command(resume=user_input), config=config)
-        print("\n--- Final Result ---")
-        print(final_result["final_report"])
+    # 3. Print the Final Output ONLY when the while loop breaks
+    final_data = app.get_state(config).values
+    print("\n--- Final Output ---")
+    if final_data.get("final_report"):
+        print(final_data["final_report"])
+    else:
+        print("No report was generated (Engine terminated early).")
+        
 
 if __name__ == "__main__":
     run_workflow()
